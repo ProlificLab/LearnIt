@@ -458,6 +458,185 @@ def get_job_status(job_id):
     return json_response(background_jobs[job_id])
 
 
+# ============== Community Sources ==============
+
+@app.route('/api/community/sources', methods=['GET'])
+def list_community_sources():
+    """List available community sources."""
+    return json_response({
+        'sources': [
+            {
+                'id': 'stackoverflow',
+                'name': 'Stack Overflow',
+                'description': 'Q&A for Excel, VBA, Power BI, DAX',
+                'tags': ['excel', 'vba', 'powerbi', 'dax', 'power-query']
+            },
+            {
+                'id': 'reddit',
+                'name': 'Reddit',
+                'description': 'Community discussions from r/excel, r/vba, r/PowerBI',
+                'subreddits': ['excel', 'vba', 'PowerBI', 'excelevator']
+            },
+            {
+                'id': 'mstech',
+                'name': 'Microsoft Tech Community',
+                'description': 'Official Microsoft community forums',
+                'boards': ['excel', 'powerbi', 'powerquery']
+            },
+            {
+                'id': 'powerbi',
+                'name': 'Power BI Community',
+                'description': 'Official Power BI community',
+                'categories': ['desktop', 'service', 'dax', 'dataflows']
+            }
+        ]
+    })
+
+
+@app.route('/api/community/scrape', methods=['POST'])
+def scrape_community():
+    """Start a community scraping job (background)."""
+    data = request.get_json() or {}
+    source = data.get('source', 'all')
+    pages = data.get('pages', 5)
+
+    job_id = f"community_{source}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def run_community_scrape():
+        from community_scrapers import (
+            StackOverflowScraper, RedditScraper,
+            MSTechCommunityScraper, PowerBICommunityScraper,
+            TopicAnalyzer
+        )
+
+        scrapers = {
+            'stackoverflow': StackOverflowScraper,
+            'reddit': RedditScraper,
+            'mstech': MSTechCommunityScraper,
+            'powerbi': PowerBICommunityScraper,
+        }
+
+        sources_to_run = list(scrapers.keys()) if source == 'all' else [source]
+        all_questions = []
+
+        background_jobs[job_id] = {
+            'status': 'running',
+            'source': source,
+            'started_at': datetime.now().isoformat(),
+            'scraped': 0,
+            'sources_completed': []
+        }
+
+        for src in sources_to_run:
+            if src in scrapers:
+                try:
+                    scraper = scrapers[src](db)
+                    questions = scraper.scrape(pages=pages)
+                    all_questions.extend(questions)
+                    background_jobs[job_id]['scraped'] = len(all_questions)
+                    background_jobs[job_id]['sources_completed'].append(src)
+                except Exception as e:
+                    background_jobs[job_id]['error'] = f"{src}: {str(e)}"
+
+        # Run topic analysis
+        if all_questions:
+            analyzer = TopicAnalyzer(all_questions)
+            background_jobs[job_id]['insights'] = {
+                'common_topics': analyzer.get_common_words(20),
+                'unanswered': analyzer.get_unanswered_topics(10),
+                'by_source': analyzer.get_source_summary()
+            }
+
+        background_jobs[job_id]['status'] = 'completed'
+        background_jobs[job_id]['completed_at'] = datetime.now().isoformat()
+
+    thread = threading.Thread(target=run_community_scrape)
+    thread.start()
+
+    return json_response({
+        'job_id': job_id,
+        'message': f'Community scraping started for {source}'
+    })
+
+
+@app.route('/api/community/trending', methods=['GET'])
+def get_trending_topics():
+    """Get trending topics from communities."""
+    source = request.args.get('source', 'reddit')
+
+    try:
+        if source == 'reddit':
+            from community_scrapers import RedditScraper
+            scraper = RedditScraper()
+            topics = scraper.get_trending_topics('excel', limit=20)
+            return json_response({'source': 'reddit', 'topics': topics})
+
+        elif source == 'stackoverflow':
+            from community_scrapers import StackOverflowScraper
+            scraper = StackOverflowScraper()
+            tags = scraper.get_trending_tags(count=30)
+            return json_response({'source': 'stackoverflow', 'trending_tags': tags})
+
+        elif source == 'powerbi':
+            from community_scrapers import PowerBICommunityScraper
+            scraper = PowerBICommunityScraper()
+            ideas = scraper.get_ideas(pages=2)
+            return json_response({'source': 'powerbi', 'feature_ideas': ideas})
+
+        else:
+            return error_response(f'Unknown source: {source}')
+
+    except Exception as e:
+        return error_response(f'Error fetching trends: {str(e)}', 500)
+
+
+@app.route('/api/community/analyze', methods=['GET'])
+def analyze_community_data():
+    """Analyze scraped community data."""
+    # Get all discussions from community sources
+    community_sources = ['StackOverflow', 'Reddit', 'MSTechCommunity', 'PowerBICommunity']
+
+    discussions = []
+    for source in community_sources:
+        discussions.extend(db.get_discussions(forum_source=source, limit=1000))
+
+    if not discussions:
+        return json_response({
+            'message': 'No community data found. Run /api/community/scrape first.',
+            'total': 0
+        })
+
+    # Analyze
+    from community_scrapers import Question, TopicAnalyzer
+
+    questions = []
+    for d in discussions:
+        q = Question(
+            title=d.get('title', ''),
+            url=d.get('url', ''),
+            body='',
+            author=d.get('author', ''),
+            created_at=d.get('date_created', ''),
+            tags=d.get('tags', '').split(',') if isinstance(d.get('tags'), str) else [],
+            views=d.get('views', 0),
+            answers_count=d.get('replies', 0),
+            is_answered=bool(d.get('is_solved')),
+            source=d.get('forum_source', ''),
+            category=d.get('category', '')
+        )
+        questions.append(q)
+
+    analyzer = TopicAnalyzer(questions)
+
+    return json_response({
+        'total_questions': len(questions),
+        'common_topics': analyzer.get_common_words(30),
+        'unanswered_topics': analyzer.get_unanswered_topics(20),
+        'tag_distribution': dict(list(analyzer.get_tag_distribution().items())[:30]),
+        'by_source': analyzer.get_source_summary()
+    })
+
+
 # ============== Scraping ==============
 
 @app.route('/api/scrape', methods=['POST'])
