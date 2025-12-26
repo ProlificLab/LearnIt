@@ -712,6 +712,810 @@ class PowerBICommunityScraper(BaseCommunityScraper):
         return ideas
 
 
+# ============== Super User (Stack Exchange) ==============
+
+class SuperUserScraper(BaseCommunityScraper):
+    """
+    Scraper for Super User (superuser.com) - Stack Exchange site for power users.
+
+    Covers Excel, spreadsheets, and general office software questions.
+    """
+
+    API_BASE = "https://api.stackexchange.com/2.3"
+
+    EXCEL_TAGS = ['microsoft-excel', 'excel-formula', 'excel-vba', 'spreadsheet',
+                  'google-sheets', 'libreoffice-calc', 'xlsx', 'csv']
+
+    @property
+    def source_name(self) -> str:
+        return "SuperUser"
+
+    def scrape(self, tags: List[str] = None, pages: int = 5,
+               sort: str = 'votes', include_body: bool = True) -> List[Question]:
+        """
+        Scrape questions from Super User.
+
+        Args:
+            tags: Tags to search for (default: Excel-related tags)
+            pages: Number of pages to fetch
+            sort: Sort order - 'votes', 'activity', 'creation', 'hot'
+            include_body: Whether to fetch full question body
+        """
+        if tags is None:
+            tags = self.EXCEL_TAGS
+
+        logger.info(f"Scraping Super User for tags: {tags}")
+
+        for tag in tags:
+            logger.info(f"Fetching questions for tag: {tag}")
+
+            for page in range(1, pages + 1):
+                questions = self._fetch_questions(tag, page, sort, include_body)
+
+                if not questions:
+                    break
+
+                for q in questions:
+                    self.questions.append(q)
+                    self.save_to_db(q)
+
+                logger.info(f"  Page {page}: {len(questions)} questions")
+
+        logger.info(f"Total scraped: {len(self.questions)} questions")
+        return self.questions
+
+    def _fetch_questions(self, tag: str, page: int, sort: str,
+                         include_body: bool) -> List[Question]:
+        """Fetch questions for a tag."""
+        params = {
+            'order': 'desc',
+            'sort': sort,
+            'tagged': tag,
+            'site': 'superuser',
+            'page': page,
+            'pagesize': 100,
+            'filter': 'withbody' if include_body else 'default'
+        }
+
+        response = self.fetch(f"{self.API_BASE}/questions", params)
+        if not response:
+            return []
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            return []
+
+        questions = []
+        for item in data.get('items', []):
+            q = Question(
+                title=item.get('title', ''),
+                url=item.get('link', ''),
+                body=item.get('body', ''),
+                author=item.get('owner', {}).get('display_name', 'Unknown'),
+                created_at=datetime.fromtimestamp(
+                    item.get('creation_date', 0)
+                ).isoformat(),
+                tags=item.get('tags', []),
+                score=item.get('score', 0),
+                views=item.get('view_count', 0),
+                answers_count=item.get('answer_count', 0),
+                is_answered=item.get('is_answered', False),
+                source=self.source_name,
+                source_id=str(item.get('question_id', '')),
+                category=tag
+            )
+            questions.append(q)
+
+        return questions
+
+
+# ============== YouTube Comments/Tutorials ==============
+
+class YouTubeScraper(BaseCommunityScraper):
+    """
+    Scraper for YouTube comments and video metadata.
+
+    Focuses on Excel and Power BI tutorial videos to understand
+    what topics are being taught and what questions people ask.
+
+    Note: Requires YouTube Data API key for full functionality.
+    Falls back to web scraping for basic data.
+    """
+
+    API_BASE = "https://www.googleapis.com/youtube/v3"
+
+    SEARCH_QUERIES = [
+        'excel tutorial', 'excel tips', 'excel formula tutorial',
+        'vba tutorial', 'excel vba', 'power bi tutorial',
+        'dax tutorial', 'power query tutorial', 'pivot table tutorial',
+        'excel for beginners', 'advanced excel', 'excel data analysis'
+    ]
+
+    def __init__(self, db: ForumDatabase = None, delay: float = 1.0, api_key: str = None):
+        super().__init__(db, delay)
+        self.api_key = api_key
+
+    @property
+    def source_name(self) -> str:
+        return "YouTube"
+
+    def scrape(self, queries: List[str] = None, max_results: int = 50,
+               fetch_comments: bool = True) -> List[Question]:
+        """
+        Scrape YouTube videos and comments about Excel/Power BI.
+
+        Args:
+            queries: Search queries (default: Excel/PBI tutorials)
+            max_results: Max results per query
+            fetch_comments: Whether to fetch video comments
+        """
+        if queries is None:
+            queries = self.SEARCH_QUERIES
+
+        if not self.api_key:
+            logger.warning("No YouTube API key provided. Using web scraping fallback.")
+            return self._scrape_without_api(queries, max_results)
+
+        for query in queries:
+            logger.info(f"Searching YouTube for: {query}")
+            videos = self._search_videos(query, max_results)
+
+            for video in videos:
+                self.questions.append(video)
+                self.save_to_db(video)
+
+                if fetch_comments:
+                    comments = self._fetch_comments(video.source_id)
+                    logger.info(f"  Fetched {len(comments)} comments for {video.title[:50]}...")
+
+            logger.info(f"  Found {len(videos)} videos")
+
+        logger.info(f"Total scraped: {len(self.questions)} videos")
+        return self.questions
+
+    def _search_videos(self, query: str, max_results: int) -> List[Question]:
+        """Search for videos using YouTube API."""
+        params = {
+            'part': 'snippet',
+            'q': query,
+            'type': 'video',
+            'maxResults': min(max_results, 50),
+            'key': self.api_key,
+            'relevanceLanguage': 'en',
+            'order': 'relevance'
+        }
+
+        response = self.fetch(f"{self.API_BASE}/search", params)
+        if not response:
+            return []
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            return []
+
+        videos = []
+        video_ids = [item['id']['videoId'] for item in data.get('items', [])]
+
+        # Get video statistics
+        stats = self._get_video_stats(video_ids)
+
+        for item in data.get('items', []):
+            video_id = item['id']['videoId']
+            snippet = item.get('snippet', {})
+            video_stats = stats.get(video_id, {})
+
+            q = Question(
+                title=snippet.get('title', ''),
+                url=f"https://www.youtube.com/watch?v={video_id}",
+                body=snippet.get('description', ''),
+                author=snippet.get('channelTitle', 'Unknown'),
+                created_at=snippet.get('publishedAt', ''),
+                tags=[query],
+                score=int(video_stats.get('likeCount', 0)),
+                views=int(video_stats.get('viewCount', 0)),
+                answers_count=int(video_stats.get('commentCount', 0)),
+                is_answered=True,  # Tutorials are "answers"
+                source=self.source_name,
+                source_id=video_id,
+                category=query
+            )
+            videos.append(q)
+
+        return videos
+
+    def _get_video_stats(self, video_ids: List[str]) -> Dict[str, Dict]:
+        """Get statistics for multiple videos."""
+        if not video_ids:
+            return {}
+
+        params = {
+            'part': 'statistics',
+            'id': ','.join(video_ids),
+            'key': self.api_key
+        }
+
+        response = self.fetch(f"{self.API_BASE}/videos", params)
+        if not response:
+            return {}
+
+        try:
+            data = response.json()
+            return {
+                item['id']: item.get('statistics', {})
+                for item in data.get('items', [])
+            }
+        except (json.JSONDecodeError, KeyError):
+            return {}
+
+    def _fetch_comments(self, video_id: str, max_comments: int = 100) -> List[Dict]:
+        """Fetch comments for a video."""
+        params = {
+            'part': 'snippet',
+            'videoId': video_id,
+            'maxResults': min(max_comments, 100),
+            'key': self.api_key,
+            'order': 'relevance'
+        }
+
+        response = self.fetch(f"{self.API_BASE}/commentThreads", params)
+        if not response:
+            return []
+
+        try:
+            data = response.json()
+            comments = []
+
+            for item in data.get('items', []):
+                snippet = item.get('snippet', {}).get('topLevelComment', {}).get('snippet', {})
+                comments.append({
+                    'text': snippet.get('textDisplay', ''),
+                    'author': snippet.get('authorDisplayName', 'Unknown'),
+                    'likes': snippet.get('likeCount', 0),
+                    'published_at': snippet.get('publishedAt', '')
+                })
+
+            return comments
+        except (json.JSONDecodeError, KeyError):
+            return []
+
+    def _scrape_without_api(self, queries: List[str], max_results: int) -> List[Question]:
+        """Fallback scraping without API key using web scraping."""
+        for query in queries:
+            logger.info(f"Scraping YouTube search results for: {query}")
+
+            search_url = f"https://www.youtube.com/results?search_query={quote(query)}"
+            response = self.fetch(search_url)
+
+            if not response:
+                continue
+
+            # Parse initial data from page
+            soup = BeautifulSoup(response.text, 'lxml')
+
+            # YouTube loads content via JavaScript, so we try to find initial data
+            scripts = soup.find_all('script')
+            for script in scripts:
+                if script.string and 'var ytInitialData' in script.string:
+                    try:
+                        # Extract JSON from script
+                        json_str = re.search(r'var ytInitialData = ({.*?});', script.string, re.DOTALL)
+                        if json_str:
+                            data = json.loads(json_str.group(1))
+                            videos = self._parse_youtube_initial_data(data, query)
+                            for v in videos[:max_results]:
+                                self.questions.append(v)
+                                self.save_to_db(v)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+
+        return self.questions
+
+    def _parse_youtube_initial_data(self, data: Dict, category: str) -> List[Question]:
+        """Parse YouTube initial data JSON."""
+        videos = []
+
+        try:
+            contents = (data.get('contents', {})
+                       .get('twoColumnSearchResultsRenderer', {})
+                       .get('primaryContents', {})
+                       .get('sectionListRenderer', {})
+                       .get('contents', []))
+
+            for section in contents:
+                items = (section.get('itemSectionRenderer', {})
+                        .get('contents', []))
+
+                for item in items:
+                    video_data = item.get('videoRenderer', {})
+                    if not video_data:
+                        continue
+
+                    video_id = video_data.get('videoId', '')
+                    title_runs = video_data.get('title', {}).get('runs', [])
+                    title = title_runs[0].get('text', '') if title_runs else ''
+
+                    channel_runs = video_data.get('ownerText', {}).get('runs', [])
+                    channel = channel_runs[0].get('text', '') if channel_runs else 'Unknown'
+
+                    view_text = video_data.get('viewCountText', {}).get('simpleText', '0')
+                    views = int(re.sub(r'\D', '', view_text) or 0)
+
+                    q = Question(
+                        title=title,
+                        url=f"https://www.youtube.com/watch?v={video_id}",
+                        body='',
+                        author=channel,
+                        created_at='',
+                        tags=[category],
+                        views=views,
+                        source=self.source_name,
+                        source_id=video_id,
+                        category=category
+                    )
+                    videos.append(q)
+
+        except (KeyError, TypeError):
+            pass
+
+        return videos
+
+
+# ============== GitHub Issues ==============
+
+class GitHubIssuesScraper(BaseCommunityScraper):
+    """
+    Scraper for GitHub Issues from Excel/Power BI related repositories.
+
+    Helps identify common problems and feature requests.
+    Uses GitHub's public API (no auth required for public repos).
+    """
+
+    API_BASE = "https://api.github.com"
+
+    # Popular Excel/Power BI related repositories
+    REPOS = [
+        # Python Excel libraries
+        'python-excel/xlrd',
+        'python-excel/xlwt',
+        'jmcnamara/XlsxWriter',
+        'openpyxl/openpyxl',
+        'pandas-dev/pandas',  # Has Excel-related issues
+
+        # Power BI tools
+        'microsoft/powerbi-client-python',
+        'microsoft/PowerBI-visuals-tools',
+        'microsoft/powerbi-powershell',
+
+        # VBA/Office tools
+        'rubberduck-vba/Rubberduck',
+        'DecimalTurn/VBA-on-GitHub',
+
+        # Excel-related JS libraries
+        'SheetJS/sheetjs',
+        'exceljs/exceljs',
+    ]
+
+    def __init__(self, db: ForumDatabase = None, delay: float = 1.0, token: str = None):
+        super().__init__(db, delay)
+        if token:
+            self.session.headers['Authorization'] = f'token {token}'
+
+    @property
+    def source_name(self) -> str:
+        return "GitHub"
+
+    def scrape(self, repos: List[str] = None, state: str = 'all',
+               per_repo: int = 100) -> List[Question]:
+        """
+        Scrape issues from GitHub repositories.
+
+        Args:
+            repos: Repository list as 'owner/repo' (default: Excel/PBI repos)
+            state: Issue state - 'open', 'closed', 'all'
+            per_repo: Max issues per repository
+        """
+        if repos is None:
+            repos = self.REPOS
+
+        for repo in repos:
+            logger.info(f"Scraping GitHub issues for: {repo}")
+            issues = self._fetch_issues(repo, state, per_repo)
+
+            for issue in issues:
+                self.questions.append(issue)
+                self.save_to_db(issue)
+
+            logger.info(f"  Fetched {len(issues)} issues")
+
+        logger.info(f"Total scraped: {len(self.questions)} issues")
+        return self.questions
+
+    def _fetch_issues(self, repo: str, state: str, limit: int) -> List[Question]:
+        """Fetch issues from a repository."""
+        issues = []
+        page = 1
+
+        while len(issues) < limit:
+            params = {
+                'state': state,
+                'per_page': min(100, limit - len(issues)),
+                'page': page,
+                'sort': 'comments',
+                'direction': 'desc'
+            }
+
+            response = self.fetch(f"{self.API_BASE}/repos/{repo}/issues", params)
+            if not response:
+                break
+
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                break
+
+            if not data:
+                break
+
+            for item in data:
+                # Skip pull requests
+                if 'pull_request' in item:
+                    continue
+
+                labels = [label.get('name', '') for label in item.get('labels', [])]
+
+                q = Question(
+                    title=item.get('title', ''),
+                    url=item.get('html_url', ''),
+                    body=item.get('body', '') or '',
+                    author=item.get('user', {}).get('login', 'Unknown'),
+                    created_at=item.get('created_at', ''),
+                    tags=labels,
+                    score=item.get('reactions', {}).get('+1', 0),
+                    answers_count=item.get('comments', 0),
+                    is_answered=item.get('state') == 'closed',
+                    source=f"GitHub/{repo}",
+                    source_id=str(item.get('number', '')),
+                    category=repo.split('/')[-1]
+                )
+                issues.append(q)
+
+            page += 1
+
+            # Check rate limit
+            remaining = response.headers.get('X-RateLimit-Remaining', '0')
+            if int(remaining) < 5:
+                logger.warning(f"GitHub API rate limit low: {remaining} remaining")
+                break
+
+        return issues
+
+    def search_issues(self, query: str, max_results: int = 100) -> List[Question]:
+        """Search GitHub issues with a query."""
+        params = {
+            'q': f'{query} type:issue',
+            'sort': 'reactions-+1',
+            'order': 'desc',
+            'per_page': min(100, max_results)
+        }
+
+        response = self.fetch(f"{self.API_BASE}/search/issues", params)
+        if not response:
+            return []
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            return []
+
+        issues = []
+        for item in data.get('items', []):
+            labels = [label.get('name', '') for label in item.get('labels', [])]
+
+            # Extract repo name from URL
+            repo_url = item.get('repository_url', '')
+            repo = '/'.join(repo_url.split('/')[-2:]) if repo_url else 'Unknown'
+
+            q = Question(
+                title=item.get('title', ''),
+                url=item.get('html_url', ''),
+                body=item.get('body', '') or '',
+                author=item.get('user', {}).get('login', 'Unknown'),
+                created_at=item.get('created_at', ''),
+                tags=labels + [query],
+                score=item.get('reactions', {}).get('+1', 0),
+                answers_count=item.get('comments', 0),
+                is_answered=item.get('state') == 'closed',
+                source=f"GitHub/{repo}",
+                source_id=str(item.get('number', '')),
+                category='Search: ' + query
+            )
+            issues.append(q)
+
+        return issues
+
+
+# ============== OzGrid Forum ==============
+
+class OzGridScraper(BaseCommunityScraper):
+    """
+    Scraper for OzGrid Excel Forum (ozgrid.com/forum).
+
+    One of the oldest Excel help forums with extensive archives.
+    """
+
+    BASE_URL = "https://www.ozgrid.com/forum"
+
+    CATEGORIES = {
+        'excel-general': '/excel-general-90/',
+        'excel-vba': '/excel-and-vba-90/',
+        'excel-formulas': '/excel-formulas-90/',
+        'excel-worksheet': '/worksheet-functions-90/',
+        'charts': '/excel-charts-90/',
+        'data-analysis': '/data-analysis-90/',
+    }
+
+    @property
+    def source_name(self) -> str:
+        return "OzGrid"
+
+    def scrape(self, categories: List[str] = None, pages: int = 5) -> List[Question]:
+        """
+        Scrape threads from OzGrid forum.
+
+        Args:
+            categories: Categories to scrape (default: all)
+            pages: Pages to scrape per category
+        """
+        if categories is None:
+            categories = list(self.CATEGORIES.keys())
+
+        for cat in categories:
+            cat_path = self.CATEGORIES.get(cat)
+            if not cat_path:
+                continue
+
+            logger.info(f"Scraping OzGrid: {cat}")
+
+            for page in range(1, pages + 1):
+                # OzGrid uses page-N for pagination
+                url = f"{self.BASE_URL}{cat_path}page-{page}"
+                response = self.fetch(url)
+
+                if not response:
+                    break
+
+                questions = self._parse_forum_page(response.text, cat)
+                for q in questions:
+                    self.questions.append(q)
+                    self.save_to_db(q)
+
+                logger.info(f"  Page {page}: {len(questions)} threads")
+
+                if len(questions) < 10:
+                    break
+
+        logger.info(f"Total scraped: {len(self.questions)} threads")
+        return self.questions
+
+    def _parse_forum_page(self, html: str, category: str) -> List[Question]:
+        """Parse a forum page for threads."""
+        soup = BeautifulSoup(html, 'lxml')
+        questions = []
+
+        # Find thread listings
+        threads = soup.select('.structItem--thread, .discussionListItem')
+
+        for thread in threads:
+            try:
+                # Title and URL
+                title_elem = thread.select_one('.structItem-title a, .title a')
+                if not title_elem:
+                    continue
+
+                title = title_elem.get_text(strip=True)
+                url = urljoin(self.BASE_URL, title_elem.get('href', ''))
+
+                # Skip sticky threads
+                if thread.select_one('.structItem-status--sticky, .sticky'):
+                    continue
+
+                # Author
+                author_elem = thread.select_one('.username, .author')
+                author = author_elem.get_text(strip=True) if author_elem else 'Unknown'
+
+                # Date
+                date_elem = thread.select_one('.structItem-startDate time, .DateTime')
+                created_at = date_elem.get('datetime', '') if date_elem else ''
+
+                # Replies
+                reply_elem = thread.select_one('.pairs--justified .minor dd, .stats .major')
+                replies = 0
+                if reply_elem:
+                    try:
+                        replies = int(re.sub(r'\D', '', reply_elem.get_text()))
+                    except ValueError:
+                        pass
+
+                # Views
+                views_elem = thread.select_one('.structItem-cell--meta .pairs:last-child dd, .views')
+                views = 0
+                if views_elem:
+                    try:
+                        text = views_elem.get_text().upper()
+                        if 'K' in text:
+                            views = int(float(text.replace('K', '')) * 1000)
+                        else:
+                            views = int(re.sub(r'\D', '', text))
+                    except ValueError:
+                        pass
+
+                # Check if solved
+                is_solved = bool(thread.select_one('.solved, .label--solved, [class*="solved"]'))
+
+                q = Question(
+                    title=title,
+                    url=url,
+                    body='',
+                    author=author,
+                    created_at=created_at,
+                    tags=[category],
+                    views=views,
+                    answers_count=replies,
+                    is_answered=is_solved,
+                    source=self.source_name,
+                    category=category
+                )
+                questions.append(q)
+
+            except Exception as e:
+                logger.debug(f"Error parsing thread: {e}")
+                continue
+
+        return questions
+
+
+# ============== Quora ==============
+
+class QuoraScraper(BaseCommunityScraper):
+    """
+    Scraper for Quora Excel and Power BI topics.
+
+    Note: Quora heavily restricts scraping. This uses their topic pages
+    which are somewhat accessible.
+    """
+
+    BASE_URL = "https://www.quora.com"
+
+    TOPICS = {
+        'excel': '/topic/Microsoft-Excel',
+        'excel-tips': '/topic/Microsoft-Excel-Tips-and-Tricks',
+        'vba': '/topic/Visual-Basic-for-Applications-VBA',
+        'powerbi': '/topic/Microsoft-Power-BI',
+        'spreadsheets': '/topic/Spreadsheets',
+        'data-analysis': '/topic/Data-Analysis',
+        'pivot-tables': '/topic/Pivot-Tables',
+    }
+
+    @property
+    def source_name(self) -> str:
+        return "Quora"
+
+    def scrape(self, topics: List[str] = None, pages: int = 3) -> List[Question]:
+        """
+        Scrape questions from Quora topics.
+
+        Args:
+            topics: Topics to scrape (default: all Excel/PBI topics)
+            pages: Scroll-pages to scrape per topic (limited by anti-scraping)
+        """
+        if topics is None:
+            topics = list(self.TOPICS.keys())
+
+        # Update headers for Quora
+        self.session.headers.update({
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'en-US,en;q=0.9',
+        })
+
+        for topic in topics:
+            topic_path = self.TOPICS.get(topic)
+            if not topic_path:
+                continue
+
+            logger.info(f"Scraping Quora topic: {topic}")
+
+            url = f"{self.BASE_URL}{topic_path}"
+            response = self.fetch(url)
+
+            if not response:
+                continue
+
+            questions = self._parse_topic_page(response.text, topic)
+            for q in questions:
+                self.questions.append(q)
+                self.save_to_db(q)
+
+            logger.info(f"  Found {len(questions)} questions")
+
+        logger.info(f"Total scraped: {len(self.questions)} questions")
+        return self.questions
+
+    def _parse_topic_page(self, html: str, category: str) -> List[Question]:
+        """Parse a Quora topic page."""
+        soup = BeautifulSoup(html, 'lxml')
+        questions = []
+
+        # Find question items - Quora's HTML structure varies
+        items = soup.select('.q-box, [class*="Question"], .QuestionItem')
+
+        for item in items:
+            try:
+                # Question text/title
+                title_elem = item.select_one('a[href*="/question/"], .q-text span, [class*="question_text"]')
+                if not title_elem:
+                    continue
+
+                title = title_elem.get_text(strip=True)
+                if not title or len(title) < 10:
+                    continue
+
+                # URL
+                link = item.select_one('a[href*="/question/"]')
+                url = urljoin(self.BASE_URL, link.get('href', '')) if link else ''
+
+                # Author (often hidden/anonymous on Quora)
+                author_elem = item.select_one('.user, [class*="username"]')
+                author = author_elem.get_text(strip=True) if author_elem else 'Anonymous'
+
+                # Answer count
+                answer_elem = item.select_one('[class*="answer_count"], .AnswerCount')
+                answers = 0
+                if answer_elem:
+                    try:
+                        answers = int(re.sub(r'\D', '', answer_elem.get_text()))
+                    except ValueError:
+                        pass
+
+                # Check if answered (has answers)
+                is_answered = answers > 0
+
+                # Upvotes/views (if available)
+                upvote_elem = item.select_one('[class*="upvote"], .VoterCount')
+                score = 0
+                if upvote_elem:
+                    try:
+                        text = upvote_elem.get_text().upper()
+                        if 'K' in text:
+                            score = int(float(text.replace('K', '').strip()) * 1000)
+                        else:
+                            score = int(re.sub(r'\D', '', text))
+                    except ValueError:
+                        pass
+
+                q = Question(
+                    title=title,
+                    url=url,
+                    body='',
+                    author=author,
+                    created_at='',
+                    tags=[category, 'excel', 'quora'],
+                    score=score,
+                    answers_count=answers,
+                    is_answered=is_answered,
+                    source=self.source_name,
+                    category=category
+                )
+                questions.append(q)
+
+            except Exception as e:
+                logger.debug(f"Error parsing Quora item: {e}")
+                continue
+
+        return questions
+
+
 # ============== Topic Analyzer ==============
 
 class TopicAnalyzer:
@@ -831,23 +1635,33 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='Scrape Excel/Power BI communities')
-    parser.add_argument('source', choices=['stackoverflow', 'reddit', 'mstech', 'powerbi', 'all'],
-                        help='Source to scrape')
+    parser.add_argument('source', choices=[
+        'stackoverflow', 'reddit', 'mstech', 'powerbi',
+        'superuser', 'youtube', 'github', 'ozgrid', 'quora', 'all'
+    ], help='Source to scrape')
     parser.add_argument('--pages', type=int, default=5, help='Pages to scrape')
     parser.add_argument('--database', default='./data/forum_data.db', help='Database path')
     parser.add_argument('--output', default='./data', help='Output directory')
     parser.add_argument('--analyze', action='store_true', help='Run topic analysis')
+    parser.add_argument('--youtube-api-key', help='YouTube Data API key (optional)')
+    parser.add_argument('--github-token', help='GitHub API token (optional, for higher rate limits)')
 
     args = parser.parse_args()
 
     db = ForumDatabase(args.database)
     all_questions = []
 
+    # Define all available sources
     sources = {
-        'stackoverflow': StackOverflowScraper,
-        'reddit': RedditScraper,
-        'mstech': MSTechCommunityScraper,
-        'powerbi': PowerBICommunityScraper,
+        'stackoverflow': lambda: StackOverflowScraper(db),
+        'reddit': lambda: RedditScraper(db),
+        'mstech': lambda: MSTechCommunityScraper(db),
+        'powerbi': lambda: PowerBICommunityScraper(db),
+        'superuser': lambda: SuperUserScraper(db),
+        'youtube': lambda: YouTubeScraper(db, api_key=args.youtube_api_key),
+        'github': lambda: GitHubIssuesScraper(db, token=args.github_token),
+        'ozgrid': lambda: OzGridScraper(db),
+        'quora': lambda: QuoraScraper(db),
     }
 
     if args.source == 'all':
@@ -855,12 +1669,20 @@ def main():
     else:
         scrapers_to_run = [args.source]
 
-    for source in scrapers_to_run:
-        scraper_class = sources[source]
-        scraper = scraper_class(db)
+    for source_name in scrapers_to_run:
+        scraper_factory = sources[source_name]
+        scraper = scraper_factory()
 
-        print(f"\nScraping {source}...")
-        questions = scraper.scrape(pages=args.pages)
+        print(f"\nScraping {source_name}...")
+
+        # YouTube and GitHub have different scrape signatures
+        if source_name == 'youtube':
+            questions = scraper.scrape(max_results=args.pages * 10)
+        elif source_name == 'github':
+            questions = scraper.scrape(per_repo=args.pages * 20)
+        else:
+            questions = scraper.scrape(pages=args.pages)
+
         all_questions.extend(questions)
         print(f"  Scraped {len(questions)} questions")
 

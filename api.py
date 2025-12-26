@@ -488,6 +488,37 @@ def list_community_sources():
                 'name': 'Power BI Community',
                 'description': 'Official Power BI community',
                 'categories': ['desktop', 'service', 'dax', 'dataflows']
+            },
+            {
+                'id': 'superuser',
+                'name': 'Super User',
+                'description': 'Stack Exchange site for power users and Excel questions',
+                'tags': ['microsoft-excel', 'excel-formula', 'spreadsheet', 'google-sheets']
+            },
+            {
+                'id': 'youtube',
+                'name': 'YouTube',
+                'description': 'Excel/Power BI tutorial videos and comments',
+                'requires_api_key': True,
+                'queries': ['excel tutorial', 'power bi tutorial', 'vba tutorial']
+            },
+            {
+                'id': 'github',
+                'name': 'GitHub Issues',
+                'description': 'Issues from Excel/Power BI related repositories',
+                'repos': ['openpyxl/openpyxl', 'SheetJS/sheetjs', 'microsoft/powerbi-client-python']
+            },
+            {
+                'id': 'ozgrid',
+                'name': 'OzGrid Forum',
+                'description': 'Long-standing Excel help forum',
+                'categories': ['excel-general', 'excel-vba', 'excel-formulas']
+            },
+            {
+                'id': 'quora',
+                'name': 'Quora',
+                'description': 'Q&A platform with Excel and Power BI topics',
+                'topics': ['Microsoft-Excel', 'Visual-Basic-for-Applications-VBA', 'Microsoft-Power-BI']
             }
         ]
     })
@@ -499,6 +530,8 @@ def scrape_community():
     data = request.get_json() or {}
     source = data.get('source', 'all')
     pages = data.get('pages', 5)
+    youtube_api_key = data.get('youtube_api_key')
+    github_token = data.get('github_token')
 
     job_id = f"community_{source}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -506,16 +539,26 @@ def scrape_community():
         from community_scrapers import (
             StackOverflowScraper, RedditScraper,
             MSTechCommunityScraper, PowerBICommunityScraper,
+            SuperUserScraper, YouTubeScraper, GitHubIssuesScraper,
+            OzGridScraper, QuoraScraper,
             TopicAnalyzer
         )
 
-        scrapers = {
-            'stackoverflow': StackOverflowScraper,
-            'reddit': RedditScraper,
-            'mstech': MSTechCommunityScraper,
-            'powerbi': PowerBICommunityScraper,
-        }
+        # Define all scrapers with their initialization
+        def get_scrapers():
+            return {
+                'stackoverflow': lambda: StackOverflowScraper(db),
+                'reddit': lambda: RedditScraper(db),
+                'mstech': lambda: MSTechCommunityScraper(db),
+                'powerbi': lambda: PowerBICommunityScraper(db),
+                'superuser': lambda: SuperUserScraper(db),
+                'youtube': lambda: YouTubeScraper(db, api_key=youtube_api_key),
+                'github': lambda: GitHubIssuesScraper(db, token=github_token),
+                'ozgrid': lambda: OzGridScraper(db),
+                'quora': lambda: QuoraScraper(db),
+            }
 
+        scrapers = get_scrapers()
         sources_to_run = list(scrapers.keys()) if source == 'all' else [source]
         all_questions = []
 
@@ -530,13 +573,23 @@ def scrape_community():
         for src in sources_to_run:
             if src in scrapers:
                 try:
-                    scraper = scrapers[src](db)
-                    questions = scraper.scrape(pages=pages)
+                    scraper = scrapers[src]()
+
+                    # Different scrape parameters for different sources
+                    if src == 'youtube':
+                        questions = scraper.scrape(max_results=pages * 10)
+                    elif src == 'github':
+                        questions = scraper.scrape(per_repo=pages * 20)
+                    else:
+                        questions = scraper.scrape(pages=pages)
+
                     all_questions.extend(questions)
                     background_jobs[job_id]['scraped'] = len(all_questions)
                     background_jobs[job_id]['sources_completed'].append(src)
                 except Exception as e:
-                    background_jobs[job_id]['error'] = f"{src}: {str(e)}"
+                    if 'errors' not in background_jobs[job_id]:
+                        background_jobs[job_id]['errors'] = []
+                    background_jobs[job_id]['errors'].append(f"{src}: {str(e)}")
 
         # Run topic analysis
         if all_questions:
@@ -583,8 +636,21 @@ def get_trending_topics():
             ideas = scraper.get_ideas(pages=2)
             return json_response({'source': 'powerbi', 'feature_ideas': ideas})
 
+        elif source == 'github':
+            from community_scrapers import GitHubIssuesScraper
+            scraper = GitHubIssuesScraper()
+            # Search for trending Excel-related issues
+            issues = scraper.search_issues('excel', max_results=30)
+            return json_response({
+                'source': 'github',
+                'trending_issues': [
+                    {'title': q.title, 'url': q.url, 'score': q.score, 'comments': q.answers_count}
+                    for q in issues
+                ]
+            })
+
         else:
-            return error_response(f'Unknown source: {source}')
+            return error_response(f'Unknown source: {source}. Available: reddit, stackoverflow, powerbi, github')
 
     except Exception as e:
         return error_response(f'Error fetching trends: {str(e)}', 500)
@@ -594,10 +660,14 @@ def get_trending_topics():
 def analyze_community_data():
     """Analyze scraped community data."""
     # Get all discussions from community sources
-    community_sources = ['StackOverflow', 'Reddit', 'MSTechCommunity', 'PowerBICommunity']
+    community_sources = [
+        'StackOverflow', 'Reddit', 'MSTechCommunity', 'PowerBICommunity',
+        'SuperUser', 'YouTube', 'GitHub', 'OzGrid', 'Quora'
+    ]
 
     discussions = []
     for source in community_sources:
+        # Also check for sources with slashes (like GitHub/repo or Reddit/r/sub)
         discussions.extend(db.get_discussions(forum_source=source, limit=1000))
 
     if not discussions:
