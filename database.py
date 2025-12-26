@@ -185,6 +185,61 @@ class ForumDatabase:
                 )
             """)
 
+            # Enrichment data table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS enrichment (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    discussion_id INTEGER UNIQUE NOT NULL,
+                    vba_code_count INTEGER DEFAULT 0,
+                    formula_count INTEGER DEFAULT 0,
+                    sql_code_count INTEGER DEFAULT 0,
+                    attachment_count INTEGER DEFAULT 0,
+                    best_answer_index INTEGER,
+                    functions_mentioned TEXT,
+                    quality_score REAL,
+                    has_solution INTEGER DEFAULT 0,
+                    duplicate_of INTEGER,
+                    duplicate_similarity REAL,
+                    enriched_at TEXT NOT NULL,
+                    enrichment_data TEXT,
+                    FOREIGN KEY (discussion_id) REFERENCES discussions(id),
+                    FOREIGN KEY (duplicate_of) REFERENCES discussions(id)
+                )
+            """)
+
+            # Extracted code table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS extracted_code (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    discussion_id INTEGER NOT NULL,
+                    post_number INTEGER,
+                    code_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    content_compressed BLOB,
+                    language TEXT,
+                    functions_used TEXT,
+                    line_count INTEGER,
+                    extracted_at TEXT NOT NULL,
+                    FOREIGN KEY (discussion_id) REFERENCES discussions(id)
+                )
+            """)
+
+            # Extracted formulas table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS extracted_formulas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    discussion_id INTEGER NOT NULL,
+                    post_number INTEGER,
+                    formula TEXT NOT NULL,
+                    functions TEXT,
+                    cell_references TEXT,
+                    complexity_score INTEGER,
+                    is_array_formula INTEGER DEFAULT 0,
+                    extracted_at TEXT NOT NULL,
+                    FOREIGN KEY (discussion_id) REFERENCES discussions(id)
+                )
+            """)
+
             # Create indexes for common queries
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_discussions_url ON discussions(url)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_discussions_forum ON discussions(forum_source)")
@@ -194,6 +249,9 @@ class ForumDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_posts_discussion ON posts(discussion_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_forum ON users(forum_source)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_enrichment_discussion ON enrichment(discussion_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_extracted_code_discussion ON extracted_code(discussion_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_extracted_formulas_discussion ON extracted_formulas(discussion_id)")
 
     def _hash_content(self, content: str) -> str:
         """Generate a hash of content for change detection."""
@@ -742,3 +800,232 @@ class ForumDatabase:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
         return len(data['discussions'])
+
+    # Enrichment methods
+    def save_enrichment(self, discussion_id: int, enrichment_data: Dict[str, Any]) -> int:
+        """Save enrichment data for a discussion."""
+        now = datetime.now().isoformat()
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            functions = enrichment_data.get('functions_mentioned', [])
+            if isinstance(functions, list):
+                functions = json.dumps(functions)
+
+            cursor.execute("""
+                INSERT OR REPLACE INTO enrichment
+                (discussion_id, vba_code_count, formula_count, sql_code_count,
+                 attachment_count, best_answer_index, functions_mentioned,
+                 quality_score, has_solution, enriched_at, enrichment_data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                discussion_id,
+                enrichment_data.get('vba_code_count', 0),
+                enrichment_data.get('formula_count', 0),
+                enrichment_data.get('sql_code_count', 0),
+                enrichment_data.get('attachment_count', 0),
+                enrichment_data.get('best_answer_index'),
+                functions,
+                enrichment_data.get('quality_score', 0),
+                1 if enrichment_data.get('has_solution') else 0,
+                now,
+                json.dumps(enrichment_data)
+            ))
+
+            return cursor.lastrowid
+
+    def save_extracted_code(self, discussion_id: int, post_number: int,
+                            code_data: Dict[str, Any]) -> int:
+        """Save extracted code."""
+        now = datetime.now().isoformat()
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            functions = code_data.get('functions_used', [])
+            if isinstance(functions, list):
+                functions = json.dumps(functions)
+
+            cursor.execute("""
+                INSERT INTO extracted_code
+                (discussion_id, post_number, code_type, content, language,
+                 functions_used, line_count, extracted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                discussion_id,
+                post_number,
+                code_data.get('code_type', 'unknown'),
+                code_data.get('content', ''),
+                code_data.get('language', ''),
+                functions,
+                code_data.get('line_count', 0),
+                now
+            ))
+
+            return cursor.lastrowid
+
+    def save_extracted_formula(self, discussion_id: int, post_number: int,
+                               formula_data: Dict[str, Any]) -> int:
+        """Save extracted formula."""
+        now = datetime.now().isoformat()
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            functions = formula_data.get('functions', [])
+            if isinstance(functions, list):
+                functions = json.dumps(functions)
+
+            cell_refs = formula_data.get('cell_references', [])
+            if isinstance(cell_refs, list):
+                cell_refs = json.dumps(cell_refs)
+
+            cursor.execute("""
+                INSERT INTO extracted_formulas
+                (discussion_id, post_number, formula, functions, cell_references,
+                 complexity_score, is_array_formula, extracted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                discussion_id,
+                post_number,
+                formula_data.get('formula', ''),
+                functions,
+                cell_refs,
+                formula_data.get('complexity_score', 0),
+                1 if formula_data.get('is_array_formula') else 0,
+                now
+            ))
+
+            return cursor.lastrowid
+
+    def get_enrichment(self, discussion_id: int) -> Optional[Dict[str, Any]]:
+        """Get enrichment data for a discussion."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM enrichment WHERE discussion_id = ?", (discussion_id,))
+            row = cursor.fetchone()
+            if row:
+                data = dict(row)
+                if data.get('enrichment_data'):
+                    data['enrichment_data'] = json.loads(data['enrichment_data'])
+                if data.get('functions_mentioned'):
+                    data['functions_mentioned'] = json.loads(data['functions_mentioned'])
+                return data
+            return None
+
+    def get_extracted_code(self, discussion_id: int) -> List[Dict[str, Any]]:
+        """Get extracted code for a discussion."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM extracted_code WHERE discussion_id = ? ORDER BY post_number",
+                (discussion_id,)
+            )
+            results = []
+            for row in cursor.fetchall():
+                data = dict(row)
+                if data.get('functions_used'):
+                    data['functions_used'] = json.loads(data['functions_used'])
+                results.append(data)
+            return results
+
+    def get_extracted_formulas(self, discussion_id: int) -> List[Dict[str, Any]]:
+        """Get extracted formulas for a discussion."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM extracted_formulas WHERE discussion_id = ? ORDER BY post_number",
+                (discussion_id,)
+            )
+            results = []
+            for row in cursor.fetchall():
+                data = dict(row)
+                if data.get('functions'):
+                    data['functions'] = json.loads(data['functions'])
+                if data.get('cell_references'):
+                    data['cell_references'] = json.loads(data['cell_references'])
+                results.append(data)
+            return results
+
+    def get_discussions_with_code(self, code_type: str = None,
+                                   limit: int = 100) -> List[Dict[str, Any]]:
+        """Get discussions that contain extracted code."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            if code_type:
+                cursor.execute("""
+                    SELECT DISTINCT d.*, e.vba_code_count, e.formula_count
+                    FROM discussions d
+                    JOIN enrichment e ON d.id = e.discussion_id
+                    JOIN extracted_code ec ON d.id = ec.discussion_id
+                    WHERE ec.code_type = ?
+                    ORDER BY d.views DESC
+                    LIMIT ?
+                """, (code_type, limit))
+            else:
+                cursor.execute("""
+                    SELECT DISTINCT d.*, e.vba_code_count, e.formula_count
+                    FROM discussions d
+                    JOIN enrichment e ON d.id = e.discussion_id
+                    WHERE e.vba_code_count > 0 OR e.formula_count > 0
+                    ORDER BY d.views DESC
+                    LIMIT ?
+                """, (limit,))
+
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_formula_statistics(self) -> Dict[str, Any]:
+        """Get statistics about extracted formulas."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            stats = {}
+
+            cursor.execute("SELECT COUNT(*) FROM extracted_formulas")
+            stats['total_formulas'] = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM extracted_code WHERE code_type = 'vba'")
+            stats['total_vba_snippets'] = cursor.fetchone()[0]
+
+            cursor.execute("""
+                SELECT functions FROM extracted_formulas WHERE functions IS NOT NULL
+            """)
+
+            function_counts = {}
+            for row in cursor.fetchall():
+                try:
+                    functions = json.loads(row[0])
+                    for func in functions:
+                        function_counts[func] = function_counts.get(func, 0) + 1
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            stats['top_functions'] = dict(
+                sorted(function_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+            )
+
+            return stats
+
+    def mark_duplicate(self, discussion_id: int, duplicate_of: int, similarity: float):
+        """Mark a discussion as duplicate of another."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE enrichment
+                SET duplicate_of = ?, duplicate_similarity = ?
+                WHERE discussion_id = ?
+            """, (duplicate_of, similarity, discussion_id))
+
+    def get_duplicates(self, discussion_id: int) -> List[Dict[str, Any]]:
+        """Get discussions marked as duplicates of a given discussion."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT d.*, e.duplicate_similarity
+                FROM discussions d
+                JOIN enrichment e ON d.id = e.discussion_id
+                WHERE e.duplicate_of = ?
+            """, (discussion_id,))
+            return [dict(row) for row in cursor.fetchall()]

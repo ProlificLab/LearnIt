@@ -1,7 +1,22 @@
+# Core scraping
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
+aiohttp>=3.9.0
+
+# Data processing
 pandas>=2.0.0
-tqdm>=4.65.0
 python-dateutil>=2.8.0
+
+# CLI & Progress
+tqdm>=4.65.0
+
+# Rate limiting
 ratelimit>=2.2.1
+
+# API
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Optional: for production API deployment
+gunicorn>=21.0.0
