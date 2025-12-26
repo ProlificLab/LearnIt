@@ -15,6 +15,7 @@ import re
 import json
 import time
 import logging
+import functools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -23,7 +24,31 @@ from urllib.parse import urljoin, urlencode, quote
 
 import requests
 from bs4 import BeautifulSoup
-from ratelimit import limits, sleep_and_retry
+
+# Try to import ratelimit, fall back to simple implementation
+try:
+    from ratelimit import limits, sleep_and_retry
+except ImportError:
+    # Simple rate limiting fallback
+    def limits(calls, period):
+        """Simple rate limiting decorator."""
+        def decorator(func):
+            last_called = [0.0]
+            min_interval = period / calls
+
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                elapsed = time.time() - last_called[0]
+                if elapsed < min_interval:
+                    time.sleep(min_interval - elapsed)
+                last_called[0] = time.time()
+                return func(*args, **kwargs)
+            return wrapper
+        return decorator
+
+    def sleep_and_retry(func):
+        """Simple retry decorator."""
+        return func
 
 from database import ForumDatabase
 
