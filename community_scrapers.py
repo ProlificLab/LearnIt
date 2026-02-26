@@ -7,6 +7,11 @@ Supported sources:
 - Reddit (r/excel, r/vba, r/PowerBI)
 - Microsoft Tech Community
 - Power BI Community (community.powerbi.com)
+- Super User / Stack Exchange (microsoft-excel, spreadsheet tags)
+- YouTube (tutorial videos and comments)
+- GitHub Issues (Excel/Power BI related repositories)
+- OzGrid Forum (long-standing Excel help forum)
+- Quora (Excel and Power BI topics)
 
 These sources help understand what people want to learn about Excel/Power BI.
 """
